@@ -14,7 +14,7 @@ set -e
 
 # Hook phase from CLI argument: "pre" (PreToolUse) or "post" (PostToolUse)
 HOOK_PHASE="${1:-post}"
-
+echo "From observe.sh: Hook fired $(date)" >> ~/claude-hooks.log
 # ─────────────────────────────────────────────
 # Read stdin first (before project detection)
 # ─────────────────────────────────────────────
@@ -74,50 +74,6 @@ if [ -n "$STDIN_CWD" ] && [ -d "$STDIN_CWD" ]; then
 fi
 
 # ─────────────────────────────────────────────
-# Lightweight config and automated session guards
-# ─────────────────────────────────────────────
-
-CONFIG_DIR="${HOME}/.claude/homunculus"
-
-# Skip if disabled
-if [ -f "$CONFIG_DIR/disabled" ]; then
-  exit 0
-fi
-
-# Prevent observe.sh from firing on non-human sessions to avoid:
-#   - ECC observing its own Haiku observer sessions (self-loop)
-#   - ECC observing other tools' automated sessions
-#   - automated sessions creating project-scoped homunculus metadata
-
-# Layer 1: entrypoint. Only interactive terminal sessions should continue.
-case "${CLAUDE_CODE_ENTRYPOINT:-cli}" in
-  cli) ;;
-  *) exit 0 ;;
-esac
-
-# Layer 2: minimal hook profile suppresses non-essential hooks.
-[ "${ECC_HOOK_PROFILE:-standard}" = "minimal" ] && exit 0
-
-# Layer 3: cooperative skip env var for automated sessions.
-[ "${ECC_SKIP_OBSERVE:-0}" = "1" ] && exit 0
-
-# Layer 4: subagent sessions are automated by definition.
-_ECC_AGENT_ID=$(echo "$INPUT_JSON" | "$PYTHON_CMD" -c "import json,sys; print(json.load(sys.stdin).get('agent_id',''))" 2>/dev/null || true)
-[ -n "$_ECC_AGENT_ID" ] && exit 0
-
-# Layer 5: known observer-session path exclusions.
-_ECC_SKIP_PATHS="${ECC_OBSERVE_SKIP_PATHS:-observer-sessions,.claude-mem}"
-if [ -n "$STDIN_CWD" ]; then
-  IFS=',' read -ra _ECC_SKIP_ARRAY <<< "$_ECC_SKIP_PATHS"
-  for _pattern in "${_ECC_SKIP_ARRAY[@]}"; do
-    _pattern="${_pattern#"${_pattern%%[![:space:]]*}"}"
-    _pattern="${_pattern%"${_pattern##*[![:space:]]}"}"
-    [ -z "$_pattern" ] && continue
-    case "$STDIN_CWD" in *"$_pattern"*) exit 0 ;; esac
-  done
-fi
-
-# ─────────────────────────────────────────────
 # Project detection
 # ─────────────────────────────────────────────
 
@@ -133,8 +89,18 @@ PYTHON_CMD="${CLV2_PYTHON_CMD:-$PYTHON_CMD}"
 # Configuration
 # ─────────────────────────────────────────────
 
+CONFIG_DIR="${HOME}/.claude/homunculus"
 OBSERVATIONS_FILE="${PROJECT_DIR}/observations.jsonl"
 MAX_FILE_SIZE_MB=10
+echo "From observe.sh: CONFIG_DIR: $CONFIG_DIR" >> ~/claude-hooks.log
+echo "From observe.sh: OBSERVATIONS_FILE: $OBSERVATIONS_FILE" >> ~/claude-hooks.log
+echo "From observe.sh: CLAUDE_PROJECT_DIR: $CLAUDE_PROJECT_DIR" >> ~/claude-hooks.log
+echo "From observe.sh: PYTHON_CMD: $PYTHON_CMD" >> ~/claude-hooks.log
+
+# Skip if disabled
+if [ -f "$CONFIG_DIR/disabled" ]; then
+  exit 0
+fi
 
 # Auto-purge observation files older than 30 days (runs once per session)
 PURGE_MARKER="${PROJECT_DIR}/.last-purge"
@@ -271,11 +237,38 @@ if parsed["output"] is not None:
 print(json.dumps(observation))
 ' >> "$OBSERVATIONS_FILE"
 
+echo "date: $(date) From observe.sh: PROJECT_DIR: $PROJECT_DIR" >> ~/claude-hooks.log
+echo "date: $(date) From observe.sh: CONFIG_DIR: $CONFIG_DIR" >> ~/claude-hooks.log
+
+# Lazy-start observer if enabled but not running (first-time setup)
+if [ ! -f "${PROJECT_DIR}/.observer.pid" ]; then
+  # Check if observer is enabled in config
+  OBSERVER_ENABLED=false
+  CONFIG_FILE="${SKILL_ROOT}/config.json"
+  if [ -f "$CONFIG_FILE" ] && [ -n "$PYTHON_CMD" ]; then
+    _enabled=$("$PYTHON_CMD" -c "
+import json, os
+cfg = json.load(open(os.environ.get('CLV2_CONFIG', '$CONFIG_FILE')))
+print(str(cfg.get('observer', {}).get('enabled', False)).lower())
+" 2>/dev/null || echo "false")
+    if [ "$_enabled" = "true" ]; then
+      OBSERVER_ENABLED=true
+    fi
+  fi
+
+  if [ "$OBSERVER_ENABLED" = "true" ]; then
+    echo "From observe.sh: Auto-starting observer (first-time setup)..." >> ~/claude-hooks.log
+    "${SKILL_ROOT}/agents/start-observer.sh" start 2>/dev/null || true
+  fi
+fi
+
 # Signal observer if running (check both project-scoped and global observer)
 for pid_file in "${PROJECT_DIR}/.observer.pid" "${CONFIG_DIR}/.observer.pid"; do
   if [ -f "$pid_file" ]; then
     observer_pid=$(cat "$pid_file")
+    echo "From observe.sh: Observer PID found: $observer_pid" >> ~/claude-hooks.log
     if kill -0 "$observer_pid" 2>/dev/null; then
+      echo "date: $(date) From observe.sh: Sending USR1 signal to observer: $observer_pid" >> ~/claude-hooks.log
       kill -USR1 "$observer_pid" 2>/dev/null || true
     fi
   fi
